@@ -1,0 +1,24 @@
+name: Keep Repo Active
+
+on:
+  schedule:
+    # 每 30 天的凌晨 0 点触发一次（GitHub 规定 60 天不活跃会禁用）
+    - cron: '0 0 1/30 * *'
+  workflow_dispatch: # 允许你手动点击运行测试
+
+permissions:
+  contents: write
+
+jobs:
+  keep_alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Auto Commit to Keep Active
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git commit --allow-empty -m "Chore: Keep-alive commit to prevent workflow suspension"
+          git push
