@@ -135,17 +135,24 @@ def get_user_info(client, headers, user_info_url: str):
 		response = client.get(user_info_url, headers=headers, timeout=30)
 
 		if response.status_code == 200:
-			data = response.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				quota = round(user_data.get('quota', 0) / 500000, 2)
-				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
-				return {
-					'success': True,
-					'quota': quota,
-					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
-				}
+			try:
+				data = response.json()
+				if data.get('success'):
+					user_data = data.get('data', {})
+					quota = round(user_data.get('quota', 0) / 500000, 2)
+					used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+					return {
+						'success': True,
+						'quota': quota,
+						'used_quota': used_quota,
+						'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+					}
+				else:
+					error_msg = data.get('message', 'Unknown error')
+					return {'success': False, 'error': f'API error: {error_msg}'}
+			except json.JSONDecodeError:
+				response_preview = response.text[:200] if response.text else '(empty)'
+				return {'success': False, 'error': f'Invalid JSON response: {response_preview}'}
 		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
 	except Exception as e:
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
@@ -247,7 +254,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		if user_info and user_info.get('success'):
 			print(user_info['display'])
 		elif user_info:
-			print(user_info.get('error', 'Unknown error'))
+			print(f'[FAILED] {account_name}: {user_info.get("error", "Unknown error")}')
 
 		if provider_config.needs_manual_check_in():
 			success = execute_check_in(client, account_name, provider_config, headers)

@@ -7,3 +7,4 @@ __pycache__
 balance_hash.txt
 
 .DS_Store
+secret.txt
