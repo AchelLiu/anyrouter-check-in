@@ -87,105 +87,133 @@ def compute_acw_sc_v2(arg1: str) -> str:
 
 
 async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
-    """使用 Playwright 获取 WAF cookies（隐私模式）"""
-    print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
+	"""使用 Playwright 获取 WAF cookies（隐私模式）"""
+	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
 
-    async with async_playwright() as p:
-        import tempfile
+	async with async_playwright() as p:
+		import tempfile
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=temp_dir,
-                headless=False,
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-                viewport={'width': 1920, 'height': 1080},
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-dev-shm-usage',
-                    '--disable-web-security',
-                    '--disable-features=VizDisplayCompositor',
-                    '--no-sandbox',
-                ],
-            )
+		with tempfile.TemporaryDirectory() as temp_dir:
+			context = await p.chromium.launch_persistent_context(
+				user_data_dir=temp_dir,
+				headless=False,
+				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+				viewport={'width': 1920, 'height': 1080},
+				args=[
+					'--disable-blink-features=AutomationControlled',
+					'--disable-dev-shm-usage',
+					'--disable-web-security',
+					'--disable-features=VizDisplayCompositor',
+					'--no-sandbox',
+				],
+			)
 
-            page = await context.new_page()
+			page = await context.new_page()
 
-            try:
-                await page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-                """)
+			try:
+				await page.add_init_script("""
+					Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+					window.chrome = { runtime: {} };
+					Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+					Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+				""")
 
-                print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
+				print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
 
-                await page.goto(login_url, wait_until='domcontentloaded')
+				await page.goto(login_url, wait_until='domcontentloaded')
 
-                try:
-                    await page.wait_for_load_state('networkidle', timeout=15000)
-                except Exception:
-                    pass
+				try:
+					await page.wait_for_load_state('networkidle', timeout=15000)
+				except Exception:
+					pass
 
-                # Wait for JS cookies to be computed (if needed)
-                js_cookies = [c for c in required_cookies if c not in ('acw_tc', 'cdn_sec_tc')]
+				js_cookies = [c for c in required_cookies if c not in ('acw_tc', 'cdn_sec_tc')]
 
-                if js_cookies:
-                    print(f'[INFO] {account_name}: Checking for JS-computed cookies...')
-                    # Wait up to 10 seconds for JS to compute cookies
-                    for wait_attempt in range(10):
-                        await asyncio.sleep(1)
+				if js_cookies:
+					content = await page.content()
+					if 'aliyun_waf' in content and 'acw_sc__v2' in js_cookies:
+						domain = login_url.replace('https://', '').replace('http://', '').split('/')[0]
+						for waf_attempt in range(3):
+							match = re.search(r'name="aliyun_waf_aa"\s*content="([^"]+)"', content)
+							if not match:
+								print(f'[WARNING] {account_name}: Could not extract WAF challenge parameters')
+								break
+							waf_aa = match.group(1)
+							computed_value = compute_acw_sc_v2(waf_aa)
+							await context.add_cookies(
+								[{'name': 'acw_sc__v2', 'value': computed_value, 'domain': domain, 'path': '/'}]
+							)
+							print(
+								f'[INFO] {account_name}: acw_sc__v2 computed, verifying with WAF (attempt {waf_attempt + 1}/3)...'
+							)
+							try:
+								await page.reload(wait_until='domcontentloaded', timeout=15000)
+								await page.wait_for_load_state('networkidle', timeout=10000)
+							except Exception:
+								pass
+							content = await page.content()
+							if 'aliyun_waf' not in content:
+								print(f'[SUCCESS] {account_name}: WAF bypassed successfully')
+								break
+						else:
+							print(f'[WARNING] {account_name}: WAF bypass failed after 3 attempts')
 
-                        cookies_after = await context.cookies()
-                        found_js_cookies = []
-                        for cookie in cookies_after:
-                            if cookie['name'] in js_cookies and cookie['value']:
-                                found_js_cookies.append(cookie['name'])
-                                print(f'[INFO] {account_name}: Found {cookie["name"]} (computed by JS)')
+				cookies = await page.context.cookies()
+				waf_cookies = {}
+				for cookie in cookies:
+					cookie_name = cookie.get('name')
+					cookie_value = cookie.get('value')
+					if cookie_name in required_cookies and cookie_value is not None:
+						waf_cookies[cookie_name] = cookie_value
 
-                        if found_js_cookies:
-                            # Try reloading to see if WAF is bypassed
-                            try:
-                                await page.reload(wait_until='domcontentloaded', timeout=15000)
-                                await page.wait_for_load_state('networkidle', timeout=10000)
-                            except Exception:
-                                pass
+				print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
 
-                            content_after = await page.content()
-                            if 'aliyun_waf' not in content_after:
-                                print(f'[SUCCESS] {account_name}: WAF bypassed successfully')
-                                break
-                        else:
-                            print(f'[WAIT] {account_name}: Waiting for JS cookies... ({wait_attempt + 1}/10s)')
-                    else:
-                        print(f'[WARNING] {account_name}: JS cookies not found after waiting')
+				missing_cookies = [c for c in required_cookies if c not in waf_cookies]
 
-                cookies = await page.context.cookies()
-                waf_cookies = {}
-                for cookie in cookies:
-                    cookie_name = cookie.get('name')
-                    cookie_value = cookie.get('value')
-                    if cookie_name in required_cookies and cookie_value is not None:
-                        waf_cookies[cookie_name] = cookie_value
+				if missing_cookies:
+					print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
+					await context.close()
+					return None
 
-                print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
+				print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
 
-                missing_cookies = [c for c in required_cookies if c not in waf_cookies]
+				await context.close()
 
-                if missing_cookies:
-                    print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
-                    await context.close()
-                    return None
+				return waf_cookies
 
-                print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
-                await context.close()
-                return waf_cookies
+			except Exception as e:
+				print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
+				await context.close()
+				return None
 
-            except Exception as e:
-                print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
-                await context.close()
-                return None
 
+def get_user_info(client, headers, user_info_url: str):
+	"""获取用户信息"""
+	try:
+		response = client.get(user_info_url, headers=headers, timeout=30)
+
+		if response.status_code == 200:
+			try:
+				data = response.json()
+				if data.get('success'):
+					user_data = data.get('data', {})
+					quota = round(user_data.get('quota', 0) / 500000, 2)
+					used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+					return {
+						'success': True,
+						'quota': quota,
+						'used_quota': used_quota,
+						'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+					}
+				else:
+					error_msg = data.get('message', 'Unknown error')
+					return {'success': False, 'error': f'API error: {error_msg}'}
+			except json.JSONDecodeError:
+				response_preview = response.text[:200] if response.text else '(empty)'
+				return {'success': False, 'error': f'Invalid JSON response: {response_preview}'}
+		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
+	except Exception as e:
+		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
 
 
 async def check_in_via_browser(account: AccountConfig, account_name: str, provider_config) -> tuple[bool, dict | None, dict | None]:
