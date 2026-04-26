@@ -7,7 +7,6 @@ import asyncio
 import hashlib
 import json
 import os
-import re
 import sys
 from datetime import datetime
 
@@ -66,26 +65,6 @@ def parse_cookies(cookies_data):
 	return {}
 
 
-def compute_acw_sc_v2(arg1: str) -> str:
-	"""Compute acw_sc__v2 cookie from Aliyun WAF challenge parameter (aliyun_waf_aa meta tag)."""
-	key = '3000176000856006061501533003690027800375'
-	arg2 = arg1[:32]
-
-	arg4 = ''
-	for i in range(0, len(arg2), 2):
-		b = int(arg2[i : i + 2], 16)
-		tmp = format(b, 'x')
-		if len(tmp) < 2:
-			tmp = '0' + tmp
-		arg4 += tmp
-
-	result = ''
-	for i in range(len(arg4)):
-		result += format(int(arg4[i], 16) ^ int(key[i % len(key)], 16), 'x')
-
-	return result + arg1[32:]
-
-
 async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
 	"""使用 Playwright 获取 WAF cookies（隐私模式）"""
 	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
@@ -131,19 +110,27 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 
 				if js_cookies:
 					content = await page.content()
-					if 'aliyun_waf' in content and 'acw_sc__v2' in js_cookies:
-						print(f'[INFO] {account_name}: WAF JS challenge detected, computing bypass...')
-						match = re.search(r'name="aliyun_waf_aa"\s*content="([^"]+)"', content)
-						if match:
-							waf_aa = match.group(1)
-							computed_value = compute_acw_sc_v2(waf_aa)
-							domain = login_url.replace('https://', '').replace('http://', '').split('/')[0]
-							await context.add_cookies(
-								[{'name': 'acw_sc__v2', 'value': computed_value, 'domain': domain, 'path': '/'}]
-							)
-							print(f'[SUCCESS] {account_name}: acw_sc__v2 computed from WAF challenge')
-						else:
-							print(f'[WARNING] {account_name}: Could not extract WAF challenge parameters')
+					if 'aliyun_waf' in content:
+						js_cookie_check = ' && '.join(f"document.cookie.includes('{c}')" for c in js_cookies)
+						print(f'[INFO] {account_name}: WAF JS challenge detected, waiting for resolution...')
+
+						for attempt in range(5):
+							try:
+								await page.wait_for_function(js_cookie_check, timeout=15000)
+								print(f'[INFO] {account_name}: WAF JS challenge resolved')
+								break
+							except Exception:
+								if attempt < 4:
+									print(
+										f'[INFO] {account_name}: JS challenge not resolved, reloading (attempt {attempt + 2}/5)...'
+									)
+									try:
+										await page.reload(wait_until='domcontentloaded', timeout=15000)
+										await page.wait_for_load_state('networkidle', timeout=15000)
+									except Exception:
+										pass
+								else:
+									print(f'[WARNING] {account_name}: JS challenge did not resolve after retries')
 
 				cookies = await page.context.cookies()
 				waf_cookies = {}
@@ -245,18 +232,26 @@ async def check_in_via_browser(account: AccountConfig, account_name: str, provid
 
 				content = await page.content()
 				if 'aliyun_waf' in content:
-					print(f'[INFO] {account_name}: WAF challenge detected in browser fallback, computing bypass...')
-					match = re.search(r'name="aliyun_waf_aa"\s*content="([^"]+)"', content)
-					if match:
-						waf_aa = match.group(1)
-						computed_value = compute_acw_sc_v2(waf_aa)
-						domain = provider_config.domain.replace('https://', '').replace('http://', '')
-						await context.add_cookies(
-							[{'name': 'acw_sc__v2', 'value': computed_value, 'domain': domain, 'path': '/'}]
-						)
-						print(f'[SUCCESS] {account_name}: WAF bypassed via computed cookie')
-					else:
-						print(f'[WARNING] {account_name}: Could not extract WAF challenge parameters')
+					print(f'[INFO] {account_name}: WAF challenge detected in browser fallback, waiting...')
+					for attempt in range(5):
+						try:
+							await page.wait_for_function(
+								"!document.querySelector('meta[name=\"aliyun_waf_aa\"]')", timeout=15000
+							)
+							print(f'[INFO] {account_name}: WAF challenge resolved in browser')
+							break
+						except Exception:
+							if attempt < 4:
+								print(
+									f'[INFO] {account_name}: WAF not resolved, reloading (attempt {attempt + 2}/5)...'
+								)
+								try:
+									await page.reload(wait_until='domcontentloaded', timeout=15000)
+									await page.wait_for_load_state('networkidle', timeout=15000)
+								except Exception:
+									pass
+							else:
+								print(f'[WARNING] {account_name}: WAF challenge did not resolve in browser after retries')
 
 				user_cookies = parse_cookies(account.cookies)
 				domain = provider_config.domain.replace('https://', '').replace('http://', '')

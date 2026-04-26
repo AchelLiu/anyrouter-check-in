@@ -2,7 +2,6 @@ import json
 from unittest.mock import MagicMock
 
 from checkin import (
-	compute_acw_sc_v2,
 	execute_check_in,
 	format_check_in_notification,
 	generate_balance_hash,
@@ -12,27 +11,6 @@ from checkin import (
 	save_balance_hash,
 )
 from utils.config import ProviderConfig
-
-
-class TestComputeAcwScV2:
-	def test_deterministic(self):
-		arg1 = 'ff926c7f07e45e2e487a29a6197d3460'
-		assert compute_acw_sc_v2(arg1) == compute_acw_sc_v2(arg1)
-
-	def test_returns_string(self):
-		result = compute_acw_sc_v2('ff926c7f07e45e2e487a29a6197d3460')
-		assert isinstance(result, str)
-		assert len(result) >= 32
-
-	def test_different_inputs_different_outputs(self):
-		r1 = compute_acw_sc_v2('ff926c7f07e45e2e487a29a6197d3460')
-		r2 = compute_acw_sc_v2('aa926c7f07e45e2e487a29a6197d3460')
-		assert r1 != r2
-
-	def test_preserves_suffix(self):
-		arg1 = 'ff926c7f07e45e2e487a29a6197d3460extrasuffix'
-		result = compute_acw_sc_v2(arg1)
-		assert result.endswith('extrasuffix')
 
 
 class TestParseCookies:
