@@ -132,18 +132,31 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 				if js_cookies:
 					content = await page.content()
 					if 'aliyun_waf' in content and 'acw_sc__v2' in js_cookies:
-						print(f'[INFO] {account_name}: WAF JS challenge detected, computing bypass...')
-						match = re.search(r'name="aliyun_waf_aa"\s*content="([^"]+)"', content)
-						if match:
+						domain = login_url.replace('https://', '').replace('http://', '').split('/')[0]
+						for waf_attempt in range(3):
+							match = re.search(r'name="aliyun_waf_aa"\s*content="([^"]+)"', content)
+							if not match:
+								print(f'[WARNING] {account_name}: Could not extract WAF challenge parameters')
+								break
 							waf_aa = match.group(1)
 							computed_value = compute_acw_sc_v2(waf_aa)
-							domain = login_url.replace('https://', '').replace('http://', '').split('/')[0]
 							await context.add_cookies(
 								[{'name': 'acw_sc__v2', 'value': computed_value, 'domain': domain, 'path': '/'}]
 							)
-							print(f'[SUCCESS] {account_name}: acw_sc__v2 computed from WAF challenge')
+							print(
+								f'[INFO] {account_name}: acw_sc__v2 computed, verifying with WAF (attempt {waf_attempt + 1}/3)...'
+							)
+							try:
+								await page.reload(wait_until='domcontentloaded', timeout=15000)
+								await page.wait_for_load_state('networkidle', timeout=10000)
+							except Exception:
+								pass
+							content = await page.content()
+							if 'aliyun_waf' not in content:
+								print(f'[SUCCESS] {account_name}: WAF bypassed successfully')
+								break
 						else:
-							print(f'[WARNING] {account_name}: Could not extract WAF challenge parameters')
+							print(f'[WARNING] {account_name}: WAF bypass failed after 3 attempts')
 
 				cookies = await page.context.cookies()
 				waf_cookies = {}
@@ -246,17 +259,31 @@ async def check_in_via_browser(account: AccountConfig, account_name: str, provid
 				content = await page.content()
 				if 'aliyun_waf' in content:
 					print(f'[INFO] {account_name}: WAF challenge detected in browser fallback, computing bypass...')
-					match = re.search(r'name="aliyun_waf_aa"\s*content="([^"]+)"', content)
-					if match:
+					domain = provider_config.domain.replace('https://', '').replace('http://', '')
+					for waf_attempt in range(3):
+						match = re.search(r'name="aliyun_waf_aa"\s*content="([^"]+)"', content)
+						if not match:
+							print(f'[WARNING] {account_name}: Could not extract WAF challenge parameters')
+							break
 						waf_aa = match.group(1)
 						computed_value = compute_acw_sc_v2(waf_aa)
-						domain = provider_config.domain.replace('https://', '').replace('http://', '')
 						await context.add_cookies(
 							[{'name': 'acw_sc__v2', 'value': computed_value, 'domain': domain, 'path': '/'}]
 						)
-						print(f'[SUCCESS] {account_name}: WAF bypassed via computed cookie')
+						print(
+							f'[INFO] {account_name}: acw_sc__v2 computed, verifying (attempt {waf_attempt + 1}/3)...'
+						)
+						try:
+							await page.reload(wait_until='domcontentloaded', timeout=15000)
+							await page.wait_for_load_state('networkidle', timeout=10000)
+						except Exception:
+							pass
+						content = await page.content()
+						if 'aliyun_waf' not in content:
+							print(f'[SUCCESS] {account_name}: WAF bypassed in browser fallback')
+							break
 					else:
-						print(f'[WARNING] {account_name}: Could not extract WAF challenge parameters')
+						print(f'[WARNING] {account_name}: WAF bypass failed after 3 attempts in browser fallback')
 
 				user_cookies = parse_cookies(account.cookies)
 				domain = provider_config.domain.replace('https://', '').replace('http://', '')
