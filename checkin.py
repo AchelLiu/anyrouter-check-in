@@ -90,6 +90,13 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 			page = await context.new_page()
 
 			try:
+				await page.add_init_script("""
+					Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+					window.chrome = { runtime: {} };
+					Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+					Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+				""")
+
 				print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
 
 				await page.goto(login_url, wait_until='domcontentloaded')
@@ -107,15 +114,15 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 						js_cookie_check = ' && '.join(f"document.cookie.includes('{c}')" for c in js_cookies)
 						print(f'[INFO] {account_name}: WAF JS challenge detected, waiting for resolution...')
 
-						for attempt in range(3):
+						for attempt in range(5):
 							try:
 								await page.wait_for_function(js_cookie_check, timeout=15000)
 								print(f'[INFO] {account_name}: WAF JS challenge resolved')
 								break
 							except Exception:
-								if attempt < 2:
+								if attempt < 4:
 									print(
-										f'[INFO] {account_name}: JS challenge not resolved, reloading (attempt {attempt + 2}/3)...'
+										f'[INFO] {account_name}: JS challenge not resolved, reloading (attempt {attempt + 2}/5)...'
 									)
 									try:
 										await page.reload(wait_until='domcontentloaded', timeout=15000)
@@ -183,7 +190,7 @@ def get_user_info(client, headers, user_info_url: str):
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
 
 
-async def check_in_via_browser(account: AccountConfig, account_name: str, provider_config) -> tuple[bool, dict | None]:
+async def check_in_via_browser(account: AccountConfig, account_name: str, provider_config) -> tuple[bool, dict | None, dict | None]:
 	"""当 WAF cookie 提取失败时，通过浏览器直接发起 API 请求"""
 	print(f'[INFO] {account_name}: Falling back to browser-based API requests...')
 
@@ -208,6 +215,13 @@ async def check_in_via_browser(account: AccountConfig, account_name: str, provid
 			page = await context.new_page()
 
 			try:
+				await page.add_init_script("""
+					Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+					window.chrome = { runtime: {} };
+					Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+					Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+				""")
+
 				login_url = f'{provider_config.domain}{provider_config.login_path}'
 				await page.goto(login_url, wait_until='domcontentloaded')
 
@@ -215,6 +229,29 @@ async def check_in_via_browser(account: AccountConfig, account_name: str, provid
 					await page.wait_for_load_state('networkidle', timeout=15000)
 				except Exception:
 					pass
+
+				content = await page.content()
+				if 'aliyun_waf' in content:
+					print(f'[INFO] {account_name}: WAF challenge detected in browser fallback, waiting...')
+					for attempt in range(5):
+						try:
+							await page.wait_for_function(
+								"!document.querySelector('meta[name=\"aliyun_waf_aa\"]')", timeout=15000
+							)
+							print(f'[INFO] {account_name}: WAF challenge resolved in browser')
+							break
+						except Exception:
+							if attempt < 4:
+								print(
+									f'[INFO] {account_name}: WAF not resolved, reloading (attempt {attempt + 2}/5)...'
+								)
+								try:
+									await page.reload(wait_until='domcontentloaded', timeout=15000)
+									await page.wait_for_load_state('networkidle', timeout=15000)
+								except Exception:
+									pass
+							else:
+								print(f'[WARNING] {account_name}: WAF challenge did not resolve in browser after retries')
 
 				user_cookies = parse_cookies(account.cookies)
 				domain = provider_config.domain.replace('https://', '').replace('http://', '')
@@ -311,16 +348,16 @@ async def check_in_via_browser(account: AccountConfig, account_name: str, provid
 					else:
 						print(f'[FAILED] {account_name}: Check-in failed - HTTP {sign_in_response["status"]} (browser)')
 
-					return success, user_info
+					return success, None, user_info
 				else:
 					success = user_info is not None and user_info.get('success', False)
 					if success:
 						print(f'[INFO] {account_name}: Check-in completed automatically (browser)')
-					return success, user_info
+					return success, None, user_info
 
 			except Exception as e:
 				print(f'[FAILED] {account_name}: Browser-based check-in error: {e}')
-				return False, None
+				return False, None, None
 			finally:
 				await context.close()
 
@@ -438,14 +475,14 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None
+		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
 	user_cookies = parse_cookies(account.cookies)
 	if not user_cookies:
 		print(f'[FAILED] {account_name}: Invalid configuration format')
-		return False, None
+		return False, None, None
 
 	all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 	if not all_cookies:
