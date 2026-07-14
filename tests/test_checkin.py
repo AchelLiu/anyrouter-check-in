@@ -1,14 +1,17 @@
 import json
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 from checkin import (
 	check_in_account,
+	check_in_exit_code,
 	execute_check_in,
 	format_check_in_notification,
 	generate_balance_hash,
 	get_user_info,
 	load_balance_hash,
 	parse_cookies,
+	run_agentrouter_browser_check_in,
 	save_balance_hash,
 )
 from utils.config import AccountConfig, AppConfig, ProviderConfig
@@ -88,6 +91,7 @@ class TestGetUserInfo:
 		client = MagicMock()
 		response = MagicMock()
 		response.status_code = status_code
+		response.headers = {'content-type': 'application/json' if json_data is not None else 'text/html'}
 		if json_data is not None:
 			response.json.return_value = json_data
 			response.text = json.dumps(json_data)
@@ -116,7 +120,9 @@ class TestGetUserInfo:
 		client = self._make_client(200, text='<html>not json</html>')
 		result = get_user_info(client, {}, 'http://test/api/user/self')
 		assert result['success'] is False
-		assert result['error'].startswith('Failed to get user info: err:')
+		assert result['non_json'] is True
+		assert 'content-type text/html' in result['error']
+		assert 'length 21' in result['error']
 
 	def test_http_error(self):
 		client = self._make_client(403)
@@ -259,3 +265,128 @@ class TestCheckInAccountContract:
 		result = await check_in_account(account, 0, AppConfig(providers={}))
 
 		assert result == (False, None, None)
+
+
+class TestAgentRouterBrowserCheckIn:
+	async def test_uses_same_browser_context_for_waf_and_user_info(self, monkeypatch):
+		responses = [
+			{
+				'status': 200,
+				'contentType': 'application/json',
+				'bodyLength': 80,
+				'payload': {'success': True, 'data': {'quota': 5000000, 'used_quota': 1000000}},
+				'networkError': '',
+			},
+			{
+				'status': 200,
+				'contentType': 'application/json',
+				'bodyLength': 80,
+				'payload': {'success': True, 'data': {'quota': 5500000, 'used_quota': 1000000}},
+				'networkError': '',
+			},
+		]
+
+		class FakePage:
+			def __init__(self):
+				self.goto = AsyncMock()
+				self.evaluate = AsyncMock(side_effect=responses)
+
+		class FakeContext:
+			def __init__(self):
+				self.page = FakePage()
+				self.add_cookies = AsyncMock()
+				self.new_page = AsyncMock(return_value=self.page)
+				self.cookies = AsyncMock(return_value=[{'name': 'acw_tc', 'value': 'waf'}])
+				self.close = AsyncMock()
+
+		context = FakeContext()
+		monkeypatch.setattr('checkin.launch_login_context', AsyncMock(return_value=context))
+		monkeypatch.setattr('checkin.prepare_browser_page', AsyncMock())
+		monkeypatch.setattr('checkin.wait_for_waf_ready', AsyncMock())
+
+		provider = ProviderConfig(
+			name='agentrouter',
+			domain='https://agentrouter.org',
+			sign_in_path=None,
+			bypass_method='waf_cookies',
+			waf_cookie_names=['acw_tc'],
+		)
+		account = AccountConfig(
+			cookies={'session': 'secret-session'},
+			api_user='12345',
+			provider='agentrouter',
+		)
+
+		result = await run_agentrouter_browser_check_in(
+			{'session': 'secret-session'},
+			account,
+			'AgentRouter',
+			provider,
+		)
+
+		assert result[0] is True
+		assert result[1] is not None
+		assert result[2] is not None
+		assert result[1]['quota'] == 10.0
+		assert result[2]['quota'] == 11.0
+		context.add_cookies.assert_awaited_once_with(
+			[{'name': 'session', 'value': 'secret-session', 'url': 'https://agentrouter.org/'}]
+		)
+		assert context.page.evaluate.await_count == 2
+		context.close.assert_awaited_once()
+
+	async def test_reports_non_json_metadata_without_body(self, monkeypatch, capsys):
+		class FakePage:
+			goto = AsyncMock()
+			evaluate = AsyncMock(
+				return_value={
+					'status': 200,
+					'contentType': 'text/html; charset=utf-8',
+					'bodyLength': 1522,
+					'payload': None,
+					'networkError': '',
+				}
+			)
+
+		context = SimpleNamespace(
+			add_cookies=AsyncMock(),
+			new_page=AsyncMock(return_value=FakePage()),
+			cookies=AsyncMock(return_value=[{'name': 'acw_tc', 'value': 'waf'}]),
+			close=AsyncMock(),
+		)
+		monkeypatch.setattr('checkin.launch_login_context', AsyncMock(return_value=context))
+		monkeypatch.setattr('checkin.prepare_browser_page', AsyncMock())
+		monkeypatch.setattr('checkin.wait_for_waf_ready', AsyncMock())
+
+		provider = ProviderConfig(
+			name='agentrouter',
+			domain='https://agentrouter.org',
+			sign_in_path=None,
+			bypass_method='waf_cookies',
+			waf_cookie_names=['acw_tc'],
+		)
+		account = AccountConfig(cookies={'session': 'secret'}, api_user='12345', provider='agentrouter')
+
+		result = await run_agentrouter_browser_check_in(
+			{'session': 'secret'},
+			account,
+			'AgentRouter',
+			provider,
+		)
+
+		assert result[0] is False
+		assert result[2] is not None
+		assert result[2]['non_json'] is True
+		output = capsys.readouterr().out
+		assert 'content-type=text/html' in output
+		assert 'length=1522' in output
+		assert '<html' not in output
+		context.close.assert_awaited_once()
+
+
+class TestCheckInExitCode:
+	def test_all_accounts_must_succeed(self):
+		assert check_in_exit_code(4, 4) == 0
+		assert check_in_exit_code(2, 4) == 1
+		assert check_in_exit_code(0, 4) == 1
+		assert check_in_exit_code(0, 0) == 1
