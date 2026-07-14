@@ -421,7 +421,7 @@ async def run_agentrouter_browser_check_in(
 			if name and value is not None
 		]
 		if browser_cookies:
-			await context.add_cookies(browser_cookies)  # type: ignore[arg-type]
+			await context.add_cookies(browser_cookies)
 
 		page = await context.new_page()
 		await prepare_browser_page(page)
