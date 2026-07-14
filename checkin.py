@@ -42,6 +42,41 @@ load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
 
+_BROWSER_USER_INFO_FETCH_JS = """async ({ url, apiUserKey, apiUser }) => {
+	const headers = { Accept: 'application/json, text/plain, */*' };
+	if (apiUser) headers[apiUserKey] = apiUser;
+	try {
+		const response = await fetch(url, {
+			method: 'GET',
+			headers,
+			credentials: 'include',
+			cache: 'no-store',
+		});
+		const text = await response.text();
+		let payload = null;
+		try {
+			payload = JSON.parse(text);
+		} catch (_) {
+			// Return only metadata for non-JSON responses; never expose WAF HTML.
+		}
+		return {
+			status: response.status,
+			contentType: response.headers.get('content-type') || '',
+			bodyLength: new TextEncoder().encode(text).length,
+			payload,
+			networkError: '',
+		};
+	} catch (error) {
+		return {
+			status: 0,
+			contentType: '',
+			bodyLength: 0,
+			payload: null,
+			networkError: String(error).slice(0, 160),
+		};
+	}
+}"""
+
 
 def load_balance_hash():
 	"""加载余额hash"""
@@ -234,26 +269,65 @@ async def login_with_credentials(
 		return None
 
 
+def _format_user_info_result(
+	status_code: int,
+	payload: object,
+	*,
+	content_type: str = '',
+	body_length: int = 0,
+) -> dict:
+	"""将 API 响应转换为统一余额结构，非 JSON 响应只保留安全元数据。"""
+	if status_code != 200:
+		return {'success': False, 'error': f'Failed to get user info: HTTP {status_code}'}
+
+	if not isinstance(payload, dict):
+		safe_content_type = (content_type or 'unknown').split(';', 1)[0][:80]
+		return {
+			'success': False,
+			'error': (
+				'Failed to get user info: non-JSON response '
+				f'(HTTP {status_code}, content-type {safe_content_type}, length {body_length})'
+			),
+			'non_json': True,
+		}
+
+	if payload.get('success'):
+		user_data = payload.get('data', {})
+		quota = round(user_data.get('quota', 0) / 500000, 2)
+		used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+		return {
+			'success': True,
+			'quota': quota,
+			'used_quota': used_quota,
+			'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+		}
+
+	return {'success': False, 'error': f'Failed to get user info: HTTP {status_code}'}
+
+
 def get_user_info(client, headers, user_info_url: str):
-	"""获取用户信息"""
+	"""通过 HTTP 客户端获取用户信息。"""
 	try:
 		response = client.get(user_info_url, headers=headers, timeout=30)
-
-		if response.status_code == 200:
-			data = response.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				quota = round(user_data.get('quota', 0) / 500000, 2)
-				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
-				return {
-					'success': True,
-					'quota': quota,
-					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
-				}
-		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
 	except Exception as e:
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+
+	if response.status_code != 200:
+		return _format_user_info_result(response.status_code, None)
+
+	try:
+		payload = response.json()
+	except ValueError:
+		content_type = response.headers.get('content-type', '')
+		body_length = len(response.text.encode('utf-8'))
+		return _format_user_info_result(
+			response.status_code,
+			None,
+			content_type=content_type,
+			body_length=body_length,
+		)
+
+	return _format_user_info_result(response.status_code, payload)
 
 
 async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
@@ -275,6 +349,120 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 		print(f'[INFO] {account_name}: Bypass WAF not required, using user cookies directly')
 
 	return {**waf_cookies, **user_cookies}
+
+
+async def _get_user_info_from_browser(page, account_name: str, provider_config, api_user: str | None) -> dict:
+	"""在页面上下文中请求用户信息，保持浏览器指纹、WAF cookie 和出口一致。"""
+	user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+	result = await page.evaluate(
+		_BROWSER_USER_INFO_FETCH_JS,
+		{
+			'url': user_info_url,
+			'apiUserKey': provider_config.api_user_key,
+			'apiUser': api_user or '',
+		},
+	)
+
+	if not isinstance(result, dict):
+		print(f'[DIAGNOSTIC] {account_name}: Browser API returned an invalid result object')
+		return _format_user_info_result(0, None)
+
+	status_code = int(result.get('status') or 0)
+	content_type = str(result.get('contentType') or '')
+	body_length = int(result.get('bodyLength') or 0)
+	network_error = str(result.get('networkError') or '')
+	if network_error:
+		print(f'[DIAGNOSTIC] {account_name}: Browser API network error: {network_error[:160]}')
+		return {'success': False, 'error': f'Failed to get user info in browser: {network_error[:80]}'}
+
+	user_info = _format_user_info_result(
+		status_code,
+		result.get('payload'),
+		content_type=content_type,
+		body_length=body_length,
+	)
+	if not user_info.get('success'):
+		safe_content_type = (content_type or 'unknown').split(';', 1)[0][:80]
+		print(
+			f'[DIAGNOSTIC] {account_name}: Browser API response '
+			f'HTTP {status_code}, content-type={safe_content_type}, length={body_length}'
+		)
+	return user_info
+
+
+async def run_agentrouter_browser_check_in(
+	all_cookies: dict,
+	account: AccountConfig,
+	account_name: str,
+	provider_config,
+	*,
+	api_user_override: str | None = None,
+) -> tuple[bool, dict | None, dict | None]:
+	"""在同一个 CloakBrowser context 内完成 AgentRouter WAF 与自动签到。"""
+	settings = load_browser_login_settings(
+		account_name,
+		provider_config.name,
+		persist_profile=provider_config.persist_profile,
+	)
+	print(f'[PROCESSING] {account_name}: Starting browser-native AgentRouter check-in...')
+
+	try:
+		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
+		return False, None, None
+
+	page = None
+	try:
+		cookie_url = f'{provider_config.domain.rstrip("/")}/'
+		browser_cookies = [
+			{'name': str(name), 'value': str(value), 'url': cookie_url}
+			for name, value in all_cookies.items()
+			if name and value is not None
+		]
+		if browser_cookies:
+			await context.add_cookies(browser_cookies)  # type: ignore[arg-type]
+
+		page = await context.new_page()
+		await prepare_browser_page(page)
+		login_url = f'{provider_config.domain}{provider_config.login_path}'
+		print(f'[PROCESSING] {account_name}: Access login page in browser-native context...')
+		await page.goto(login_url, wait_until='domcontentloaded', timeout=min(settings.wait_timeout_ms, 60_000))
+		await wait_for_waf_ready(page, settings.wait_timeout_ms)
+
+		if provider_config.needs_waf_cookies():
+			context_cookies = await context.cookies()
+			cookie_names = {cookie.get('name') for cookie in context_cookies}
+			missing_cookies = [name for name in provider_config.waf_cookie_names if name not in cookie_names]
+			if missing_cookies:
+				print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
+				await save_login_screenshot(page, provider_config.name, account_name, 'browser-checkin-missing-waf')
+				return False, None, None
+			print(f'[SUCCESS] {account_name}: Browser-native WAF cookies ready')
+
+		api_user = api_user_override or account.api_user
+		user_info_before = await _get_user_info_from_browser(page, account_name, provider_config, api_user)
+		if user_info_before.get('success'):
+			print(user_info_before['display'])
+		else:
+			print(user_info_before.get('error', 'Unknown error'))
+
+		user_info_after = await _get_user_info_from_browser(page, account_name, provider_config, api_user)
+		if user_info_after.get('success'):
+			print(f'[INFO] {account_name}: Check-in completed in browser context')
+			return True, user_info_before, user_info_after
+
+		error = user_info_after.get('error', 'Unknown error')
+		print(f'[FAILED] {account_name}: Browser-native auto check-in failed - {error}')
+		await save_login_screenshot(page, provider_config.name, account_name, 'browser-checkin-failed')
+		return False, user_info_before, user_info_after
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser-native check-in error: {str(e)[:100]}')
+		if page is not None:
+			await save_login_screenshot(page, provider_config.name, account_name, 'browser-checkin-error')
+		return False, None, None
+	finally:
+		await context.close()
 
 
 def execute_check_in(client, account_name: str, provider_config, headers: dict):
@@ -361,6 +549,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
+	use_browser_auto_check_in = provider_config.name == 'agentrouter' and not provider_config.needs_manual_check_in()
 
 	# 邮箱密码优先
 	all_cookies = None
@@ -388,13 +577,25 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
 			return False, None, None
-		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
+		all_cookies = (
+			user_cookies
+			if use_browser_auto_check_in
+			else await prepare_cookies(account_name, provider_config, user_cookies)
+		)
 		auth_method = 'session cookies'
 
 	if not all_cookies:
 		return False, None, None
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
+	if use_browser_auto_check_in:
+		return await run_agentrouter_browser_check_in(
+			all_cookies,
+			account,
+			account_name,
+			provider_config,
+			api_user_override=resolved_api_user,
+		)
 
 	return run_check_in_requests(
 		all_cookies,
@@ -635,7 +836,12 @@ async def main():
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
 
-	sys.exit(0 if success_count > 0 else 1)
+	sys.exit(check_in_exit_code(success_count, total_count))
+
+
+def check_in_exit_code(success_count: int, total_count: int) -> int:
+	"""只有全部账号成功时返回 0，避免 GitHub Actions 隐藏部分失败。"""
+	return 0 if total_count > 0 and success_count == total_count else 1
 
 
 def run_main():
