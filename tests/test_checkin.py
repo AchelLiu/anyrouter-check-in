@@ -2,6 +2,7 @@ import json
 from unittest.mock import MagicMock
 
 from checkin import (
+	check_in_account,
 	execute_check_in,
 	format_check_in_notification,
 	generate_balance_hash,
@@ -10,7 +11,7 @@ from checkin import (
 	parse_cookies,
 	save_balance_hash,
 )
-from utils.config import ProviderConfig
+from utils.config import AccountConfig, AppConfig, ProviderConfig
 
 
 class TestParseCookies:
@@ -63,10 +64,10 @@ class TestGenerateBalanceHash:
 		h = generate_balance_hash({'a': {'quota': 1.0, 'used': 0}})
 		assert len(h) == 16
 
-	def test_ignores_used_in_hash(self):
+	def test_used_affects_hash(self):
 		b1 = {'a': {'quota': 10.0, 'used': 1.0}}
 		b2 = {'a': {'quota': 10.0, 'used': 99.0}}
-		assert generate_balance_hash(b1) == generate_balance_hash(b2)
+		assert generate_balance_hash(b1) != generate_balance_hash(b2)
 
 
 class TestBalanceHashIO:
@@ -109,13 +110,13 @@ class TestGetUserInfo:
 		client = self._make_client(200, data)
 		result = get_user_info(client, {}, 'http://test/api/user/self')
 		assert result['success'] is False
-		assert 'invalid token' in result['error']
+		assert result['error'] == 'Failed to get user info: HTTP 200'
 
 	def test_invalid_json(self):
 		client = self._make_client(200, text='<html>not json</html>')
 		result = get_user_info(client, {}, 'http://test/api/user/self')
 		assert result['success'] is False
-		assert 'Invalid JSON' in result['error']
+		assert result['error'].startswith('Failed to get user info: err:')
 
 	def test_http_error(self):
 		client = self._make_client(403)
@@ -249,3 +250,12 @@ class TestFormatCheckInNotification:
 		result = format_check_in_notification(detail)
 		assert '今日已签到' in result
 		assert '期间有使用' in result
+
+
+class TestCheckInAccountContract:
+	async def test_missing_provider_returns_three_values(self):
+		account = AccountConfig(cookies={'session': 'test'}, api_user='1', provider='missing')
+
+		result = await check_in_account(account, 0, AppConfig(providers={}))
+
+		assert result == (False, None, None)

@@ -140,7 +140,10 @@ class TestLoadAccountsConfig:
 		assert load_accounts_config() is None
 
 	def test_valid_config(self, monkeypatch):
-		accounts = [{'cookies': {'s': '1'}, 'api_user': 'u1'}, {'cookies': 'session=abc', 'api_user': 'u2', 'name': 'Test'}]
+		accounts = [
+			{'cookies': {'s': '1'}, 'api_user': 'u1'},
+			{'cookies': 'session=abc', 'api_user': 'u2', 'name': 'Test'},
+		]
 		monkeypatch.setenv('ANYROUTER_ACCOUNTS', json.dumps(accounts))
 		result = load_accounts_config()
 		assert result is not None
