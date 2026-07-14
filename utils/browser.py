@@ -611,6 +611,8 @@ async def solve_waf_slider_if_present(page: Page, timeout_ms: int = WAF_READY_TI
 
 
 async def wait_for_waf_ready(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS) -> None:
+	# 阿里云滑块可能在 domcontentloaded 数秒后才注入；先等待页面稳定，再检测挑战。
+	await wait_for_site_ready(page, timeout_ms)
 	if not await solve_waf_slider_if_present(page, timeout_ms):
 		raise TimeoutError('WAF slider verification did not complete')
 	await wait_for_site_ready(page, timeout_ms)

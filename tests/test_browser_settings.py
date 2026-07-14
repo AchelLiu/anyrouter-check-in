@@ -147,4 +147,19 @@ async def test_wait_for_waf_ready_rejects_unsolved_slider(monkeypatch):
 	with pytest.raises(TimeoutError, match='WAF slider verification did not complete'):
 		await wait_for_waf_ready(page)
 
-	wait_for_site.assert_not_awaited()
+	wait_for_site.assert_awaited_once_with(page, 30_000)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_waf_ready_rechecks_site_after_delayed_slider(monkeypatch):
+	page = SimpleNamespace()
+	solve_slider = AsyncMock(return_value=True)
+	wait_for_site = AsyncMock()
+	monkeypatch.setattr('utils.browser.solve_waf_slider_if_present', solve_slider)
+	monkeypatch.setattr('utils.browser.wait_for_site_ready', wait_for_site)
+
+	await wait_for_waf_ready(page, 45_000)
+
+	assert wait_for_site.await_count == 2
+	wait_for_site.assert_any_await(page, 45_000)
+	solve_slider.assert_awaited_once_with(page, 45_000)
