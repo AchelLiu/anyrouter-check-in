@@ -272,7 +272,32 @@
 
 ## 代理配置（可选）
 
-内置的 `agentrouter` 默认 `use_proxy: true`。如果你的运行环境访问该平台不稳定，可以在 GitHub Actions 中配置 mihomo 订阅代理。
+内置的 `agentrouter` 默认允许使用代理，但代理不是必需项。没有配置 `CHECKIN_PROXY_URL` 时，浏览器和 HTTP 请求会直接连接 AgentRouter。
+
+### 没有代理订阅：使用 session 直连
+
+如果 GitHub Actions 中的邮箱登录页面加载失败，而你又没有代理订阅，推荐改用 session cookies，避免在 runner 上操作登录表单：
+
+1. 在浏览器登录 AgentRouter，按 F12 获取 `session` cookie 和请求头中的 `New-Api-User`。
+2. 将 production environment 中的 `ANYROUTER_ACCOUNTS` 设置为：
+
+```json
+[{"name":"AgentRouter","provider":"agentrouter","cookies":{"session":"你的 session"},"api_user":"你的 New-Api-User"}]
+```
+
+3. 将 `PROVIDERS` 设置为以下内容，明确禁用代理：
+
+```json
+{"agentrouter":{"use_proxy":false}}
+```
+
+4. 不要配置 `PROXY_SUBSCRIPTION_URL`，然后手动运行一次 workflow。AgentRouter 不需要单独调用签到接口；脚本成功请求 `/api/user/self` 时会自动完成签到。
+
+如果托管 runner 直连仍被目标站点拦截，代码无法在没有可用网络出口的情况下绕过该限制。此时可以在能直连 AgentRouter 的本机运行 `uv run checkin.py`，或使用位于该网络中的 self-hosted runner，不需要购买代理订阅。
+
+### 使用订阅代理（可选）
+
+如果你的运行环境访问该平台不稳定，可以在 GitHub Actions 中配置 mihomo 订阅代理。
 
 在仓库 Settings -> Environments -> production -> Environment secrets 中添加：
 

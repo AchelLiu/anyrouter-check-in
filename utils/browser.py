@@ -219,7 +219,7 @@ async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: boo
 		else:
 			print('[INFO] Browser proxy enabled')
 	elif use_proxy:
-		print('[WARN] Provider requires proxy but CHECKIN_PROXY_URL is not set')
+		print('[INFO] CHECKIN_PROXY_URL is not set; browser will use a direct connection')
 
 	if settings.persist_profile:
 		from cloakbrowser import launch_persistent_context_async
