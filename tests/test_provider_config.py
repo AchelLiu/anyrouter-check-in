@@ -29,6 +29,18 @@ def test_provider_profile_persistence_can_override_builtin(monkeypatch):
 	assert config.providers['agentrouter'].persist_profile is True
 
 
+def test_builtin_provider_allows_partial_proxy_override(monkeypatch):
+	monkeypatch.setenv('PROVIDERS', json.dumps({'agentrouter': {'use_proxy': False}}))
+
+	config = AppConfig.load_from_env()
+
+	agentrouter = config.providers['agentrouter']
+	assert agentrouter.domain == 'https://agentrouter.org'
+	assert agentrouter.sign_in_path is None
+	assert agentrouter.waf_cookie_names == ['acw_tc']
+	assert agentrouter.use_proxy is False
+
+
 def test_custom_provider_profile_persistence_defaults_to_false(monkeypatch):
 	monkeypatch.setenv('PROVIDERS', json.dumps({'custom': {'domain': 'https://custom.example.com'}}))
 
