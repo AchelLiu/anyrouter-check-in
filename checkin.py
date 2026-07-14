@@ -426,7 +426,7 @@ def run_check_in_requests(
 			else:
 				print(f'[INFO] {account_name}: HTTP client proxy enabled')
 		elif use_proxy:
-			print(f'[WARN] {account_name}: Provider requires proxy but CHECKIN_PROXY_URL is not set')
+			print(f'[INFO] {account_name}: CHECKIN_PROXY_URL is not set; using a direct connection')
 
 		with httpx.Client(**client_kwargs) as client:
 			client.cookies.update(all_cookies)
