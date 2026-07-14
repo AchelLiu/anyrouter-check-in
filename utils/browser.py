@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,7 +54,28 @@ _pending_notify_screenshots: list[Path] = []
 FORM_ACTION_TIMEOUT_MS = 15_000
 EMAIL_TAB_TIMEOUT_MS = 8_000
 WAF_READY_TIMEOUT_MS = 30_000
+WAF_SLIDER_DETECT_TIMEOUT_MS = 15_000
+WAF_SLIDER_VERIFY_TIMEOUT_MS = 12_000
+WAF_SLIDER_MAX_ATTEMPTS = 3
 SESSION_WAIT_TIMEOUT_MS = 45_000
+
+WAF_SLIDER_SELECTORS = (
+	'#aliyunCaptcha-sliding-slider',
+	'.aliyunCaptcha-sliding-slider',
+	'.nc_iconfont.btn_slide',
+	'.btn_slide',
+	'[id$="_n1z"]',
+)
+WAF_SLIDER_TRACK_SELECTORS = (
+	'#aliyunCaptcha-sliding-body',
+	'.aliyunCaptcha-sliding-body',
+	'.nc_scale',
+)
+
+_WAF_SLIDER_CHALLENGE_JS = """() => {
+	const text = document.body?.innerText || '';
+	return /Access Verification|Please slide to verify|请按住滑块|请滑动验证/i.test(text);
+}"""
 
 _VISIBLE_CHECK_JS = """
 	const isVisible = (el) => {
@@ -476,7 +499,120 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 	return None
 
 
+async def _has_waf_slider_challenge(page: Page) -> bool:
+	try:
+		return bool(await page.evaluate(_WAF_SLIDER_CHALLENGE_JS))
+	except Exception:  # nosec B110
+		return False
+
+
+async def _visible_locator(page: Page, selectors: tuple[str, ...]) -> Locator | None:
+	for selector in selectors:
+		locator = page.locator(selector).first
+		try:
+			if await locator.is_visible() and await locator.bounding_box():
+				return locator
+		except Exception:  # nosec B112
+			continue
+	return None
+
+
+async def _wait_for_waf_slider(page: Page, timeout_ms: int) -> tuple[Locator, Locator] | None:
+	deadline = time.monotonic() + min(timeout_ms, WAF_SLIDER_DETECT_TIMEOUT_MS) / 1000
+	while time.monotonic() < deadline:
+		knob = await _visible_locator(page, WAF_SLIDER_SELECTORS)
+		track = await _visible_locator(page, WAF_SLIDER_TRACK_SELECTORS)
+		if knob is not None and track is not None:
+			return knob, track
+		await asyncio.sleep(0.25)
+	return None
+
+
+async def _drag_waf_slider(page: Page, knob: Locator, track: Locator) -> None:
+	knob_box = await knob.bounding_box()
+	track_box = await track.bounding_box()
+	if not knob_box or not track_box:
+		raise RuntimeError('WAF slider geometry is unavailable')
+
+	start_x = knob_box['x'] + knob_box['width'] / 2
+	start_y = knob_box['y'] + knob_box['height'] / 2
+	end_x = track_box['x'] + track_box['width'] - knob_box['width'] / 2 - 2
+	if end_x - start_x < 50:
+		raise RuntimeError('WAF slider track is too short')
+
+	rng = secrets.SystemRandom()
+	await page.mouse.move(start_x - rng.uniform(70, 110), start_y + rng.uniform(35, 65))
+	await page.mouse.move(start_x, start_y, steps=rng.randint(10, 18))
+	await asyncio.sleep(rng.uniform(0.35, 0.85))
+
+	mouse_down = False
+	try:
+		await page.mouse.down()
+		mouse_down = True
+		steps = rng.randint(38, 48)
+		for index in range(1, steps + 1):
+			progress = index / steps
+			eased = 1 - (1 - progress) ** 3
+			x = start_x + (end_x - start_x) * eased
+			y = start_y + math.sin(progress * math.pi) * rng.uniform(1.2, 2.2) + rng.uniform(-0.45, 0.45)
+			await page.mouse.move(x, y)
+			await asyncio.sleep(rng.uniform(0.018, 0.038))
+
+		await page.mouse.move(end_x, start_y, steps=rng.randint(2, 4))
+		await asyncio.sleep(rng.uniform(0.15, 0.3))
+		await page.mouse.up()
+		mouse_down = False
+	finally:
+		if mouse_down:
+			await page.mouse.up()
+
+
+async def _wait_for_waf_slider_clear(page: Page, timeout_ms: int = WAF_SLIDER_VERIFY_TIMEOUT_MS) -> bool:
+	deadline = time.monotonic() + timeout_ms / 1000
+	while time.monotonic() < deadline:
+		if not await _has_waf_slider_challenge(page):
+			return True
+		await asyncio.sleep(0.5)
+	return False
+
+
+async def solve_waf_slider_if_present(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS) -> bool:
+	"""仅在阿里云 WAF 滑块页出现时，用浏览器鼠标轨迹完成验证。"""
+	if not await _has_waf_slider_challenge(page):
+		return True
+
+	print('[INFO] WAF slider verification detected')
+	for attempt in range(1, WAF_SLIDER_MAX_ATTEMPTS + 1):
+		slider = await _wait_for_waf_slider(page, timeout_ms)
+		if slider is None:
+			print('[WARN] WAF slider control did not become visible')
+			return False
+
+		print(f'[PROCESSING] Completing WAF slider verification (attempt {attempt}/{WAF_SLIDER_MAX_ATTEMPTS})...')
+		try:
+			await _drag_waf_slider(page, *slider)
+		except Exception as exc:
+			print(f'[WARN] WAF slider drag failed: {str(exc)[:100]}')
+		else:
+			if await _wait_for_waf_slider_clear(page):
+				print('[SUCCESS] WAF slider verification completed')
+				return True
+
+		if attempt < WAF_SLIDER_MAX_ATTEMPTS:
+			print('[WARN] WAF slider verification was not accepted; refreshing challenge')
+			try:
+				await page.reload(wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
+			except Exception:  # nosec B110
+				pass
+			await asyncio.sleep(2)
+
+	print('[FAILED] WAF slider verification failed')
+	return False
+
+
 async def wait_for_waf_ready(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS) -> None:
+	if not await solve_waf_slider_if_present(page, timeout_ms):
+		raise TimeoutError('WAF slider verification did not complete')
 	await wait_for_site_ready(page, timeout_ms)
 
 

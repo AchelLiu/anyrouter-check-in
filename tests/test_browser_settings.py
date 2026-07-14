@@ -1,9 +1,15 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
-from utils.browser import launch_login_context, load_browser_login_settings
+from utils.browser import (
+	launch_login_context,
+	load_browser_login_settings,
+	solve_waf_slider_if_present,
+	wait_for_waf_ready,
+)
 
 
 def test_browser_login_settings_records_profile_persistence(monkeypatch, tmp_path):
@@ -98,3 +104,47 @@ async def test_launch_login_context_closes_browser_for_ephemeral_context(monkeyp
 	assert context.closed is True
 	assert browser.closed is True
 	assert not settings.profile_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_waf_slider_solver_skips_normal_page(monkeypatch):
+	page = SimpleNamespace()
+	detect = AsyncMock(return_value=False)
+	find_slider = AsyncMock()
+	monkeypatch.setattr('utils.browser._has_waf_slider_challenge', detect)
+	monkeypatch.setattr('utils.browser._wait_for_waf_slider', find_slider)
+
+	assert await solve_waf_slider_if_present(page) is True
+	find_slider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_waf_slider_solver_drags_detected_challenge(monkeypatch):
+	page = SimpleNamespace()
+	knob = SimpleNamespace()
+	track = SimpleNamespace()
+	monkeypatch.setattr('utils.browser._has_waf_slider_challenge', AsyncMock(return_value=True))
+	find_slider = AsyncMock(return_value=(knob, track))
+	drag_slider = AsyncMock()
+	wait_for_clear = AsyncMock(return_value=True)
+	monkeypatch.setattr('utils.browser._wait_for_waf_slider', find_slider)
+	monkeypatch.setattr('utils.browser._drag_waf_slider', drag_slider)
+	monkeypatch.setattr('utils.browser._wait_for_waf_slider_clear', wait_for_clear)
+
+	assert await solve_waf_slider_if_present(page) is True
+	find_slider.assert_awaited_once()
+	drag_slider.assert_awaited_once_with(page, knob, track)
+	wait_for_clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_waf_ready_rejects_unsolved_slider(monkeypatch):
+	page = SimpleNamespace()
+	monkeypatch.setattr('utils.browser.solve_waf_slider_if_present', AsyncMock(return_value=False))
+	wait_for_site = AsyncMock()
+	monkeypatch.setattr('utils.browser.wait_for_site_ready', wait_for_site)
+
+	with pytest.raises(TimeoutError, match='WAF slider verification did not complete'):
+		await wait_for_waf_ready(page)
+
+	wait_for_site.assert_not_awaited()
