@@ -16,8 +16,8 @@ if hasattr(sys.stderr, 'reconfigure'):
 	sys.stderr.reconfigure(line_buffering=True)
 
 import httpx
-from cloakbrowser import launch_async
 from dotenv import load_dotenv
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from utils.browser import (
 	BrowserLoginResult,
@@ -36,7 +36,7 @@ from utils.browser import (
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
-from utils.proxy import get_playwright_proxy, get_proxy_server
+from utils.proxy import get_proxy_server
 
 load_dotenv()
 
@@ -132,46 +132,49 @@ async def get_waf_cookies_with_browser(
 	"""使用浏览器获取 WAF cookies"""
 	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
 
-	launch_kwargs: dict = {'headless': True}
-	proxy = get_playwright_proxy(use_proxy=use_proxy)
-	if proxy:
-		launch_kwargs['proxy'] = proxy
-	browser = await launch_async(**launch_kwargs)
-
+	settings = load_browser_login_settings(account_name, 'waf', persist_profile=False)
+	context = None
+	page = None
 	try:
-		page = await browser.new_page()
+		context = await launch_login_context(settings, use_proxy=use_proxy)
+		page = await context.new_page()
 		await prepare_browser_page(page)
-		print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
-
-		await page.goto(login_url, wait_until='domcontentloaded')
-		await wait_for_waf_ready(page)
-
-		cookies = await page.context.cookies()
-
-		waf_cookies = {}
-		for cookie in cookies:
-			cookie_name = cookie.get('name')
-			cookie_value = cookie.get('value')
-			if cookie_name in required_cookies and cookie_value is not None:
-				waf_cookies[cookie_name] = cookie_value
-
-		print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
-
-		missing_cookies = [c for c in required_cookies if c not in waf_cookies]
-
-		if missing_cookies:
-			print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
-			await browser.close()
-			return None
-
-		print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
-		await browser.close()
-		return waf_cookies
-
+		for attempt in range(1, 4):
+			print(
+				f'[PROCESSING] {account_name}: Access login page to get WAF cookies '
+				f'(attempt {attempt}/3, navigation timeout {settings.wait_timeout_ms}ms)...'
+			)
+			try:
+				try:
+					await page.goto(login_url, wait_until='domcontentloaded', timeout=settings.wait_timeout_ms)
+				except PlaywrightTimeoutError:
+					# 导航超时后页面可能仍在完成 WAF 跳转，先检查就绪状态再决定是否重试。
+					print(f'[WARN] {account_name}: Navigation timed out; checking whether WAF verification completed')
+				await wait_for_waf_ready(page, settings.wait_timeout_ms)
+				cookies = await context.cookies()
+				waf_cookies = {
+					cookie['name']: cookie['value']
+					for cookie in cookies
+					if cookie.get('name') in required_cookies and cookie.get('value') is not None
+				}
+				missing_cookies = [c for c in required_cookies if c not in waf_cookies]
+				if not missing_cookies:
+					print(f'[SUCCESS] {account_name}: Successfully got all {len(waf_cookies)} WAF cookies')
+					return waf_cookies
+				print(f'[WARN] {account_name}: Missing WAF cookies: {missing_cookies}')
+			except Exception as e:
+				print(f'[WARN] {account_name}: WAF cookie attempt {attempt}/3 failed: {e}')
+			if attempt < 3:
+				await asyncio.sleep(3)
+		print(f'[FAILED] {account_name}: Unable to get WAF cookies after 3 attempts')
+		await save_login_screenshot(page, 'waf', account_name, 'waf-cookies-failed')
+		return None
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
-		await browser.close()
 		return None
+	finally:
+		if context is not None:
+			await context.close()
 
 
 async def login_with_credentials(
